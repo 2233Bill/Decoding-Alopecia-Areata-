@@ -1,0 +1,1455 @@
+---
+title: "Untitled"
+author: '520528053'
+date: "2025-04-30"
+output: html_document
+---
+
+# EDA
+
+```{r}
+library(GEOquery)
+library(R.utils)
+library(reshape2)
+library(ggplot2)
+library(limma)
+library(dplyr)
+library(pheatmap)
+library(RColorBrewer)
+library(DT)
+library(caret)
+library(randomForest)
+library(glmnet)
+library(pROC)
+library(e1071)
+library(tidyr)
+```
+
+```{r}
+gse <- getGEO(filename = 'F:/usyd_file/Science/2025/s1/Data3888/group work/w8/GSE68801_series_matrix.txt.gz',
+              getGPL = FALSE) 
+gse
+```
+
+```{r}
+sample_info <- pData(gse)
+
+eMat <- exprs(gse)
+dim(eMat)
+ncol(eMat)
+nrow(eMat)
+colnames(sample_info)
+```
+
+```{r}
+group_raw <- sample_info$`disease status:ch1`
+group <- sub(".*: ", "", group_raw)
+table(group)
+```
+
+```{r}
+sample_info <- pData(gse)
+
+sample_info$disease_status <- ifelse(sample_info$`disease status:ch1` == "Normal",
+                                     "Control", "Patient")
+
+sample_info$disease_status <- factor(sample_info$disease_status, levels = c("Control", "Patient"))
+
+table(sample_info$disease_status)
+
+table(sample_info$`gender:ch1`, sample_info$disease_status)
+head(sample_info$disease_status)
+
+```
+
+Box plots
+```{r}
+p <- ggplot(melt(exprs(gse)), aes(x=Var2, y=value)) +
+  geom_boxplot(outlier.colour="red", outlier.shape=16, outlier.size=0.5, notch=FALSE) +
+  theme(axis.text.x = element_text(angle = 180, hjust = 1)) +
+  labs(x = "Patient", y = "Expression value") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90))
+print(p)
+```
+The expression distribution of all samples is relatively consistent, indicating that the data quality is good
+
+Differential expression analysis
+```{r}
+eMat <- exprs(gse) 
+group <- sample_info$disease_status  
+
+design <- model.matrix(~ group)  
+fit <- lmFit(eMat, design)
+fit <- eBayes(fit)
+deg_results <- topTable(fit, coef = 2, number = Inf, adjust = "fdr") 
+head(deg_results)
+
+```
+The adjusted p values were all very significant, indicating a large expression difference between patients and the control group.
+
+
+### Volcano Plot
+```{r}
+deg_results$Significance <- "Not Significant"
+deg_results$Significance[deg_results$adj.P.Val < 0.05 & deg_results$logFC > 1] <- "Up"
+deg_results$Significance[deg_results$adj.P.Val < 0.05 & deg_results$logFC < -1] <- "Down"
+
+ggplot(deg_results, aes(x = logFC, y = -log10(adj.P.Val), color = Significance)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  scale_color_manual(values = c("blue", "grey", "red")) +
+  labs(title = "Volcano Plot",
+       x = "log2 Fold Change",
+       y = "-log10(FDR adjusted p-value)") +
+  theme_minimal()
+```
+The number of significantly downregulated genes (blue) is slightly greater than that of significantly up-regulated genes (red), and some genes have very high statistical significance
+
+PCA
+Select the top 500 most significantly differentially expressed genes
+```{r}
+top_genes <- rownames(deg_results[order(deg_results$adj.P.Val), ])[1:500]
+
+expr_pca <- t(eMat[top_genes, ]) 
+pca_res <- prcomp(expr_pca, scale. = TRUE)
+
+pca_df <- data.frame(
+  PC1 = pca_res$x[,1],
+  PC2 = pca_res$x[,2],
+  Group = sample_info$disease_status
+)
+
+library(ggplot2)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "PCA of Top 500 DE Genes",
+       x = paste0("PC1 (", round(summary(pca_res)$importance[2,1]*100, 1), "% variance)"),
+       y = paste0("PC2 (", round(summary(pca_res)$importance[2,2]*100, 1), "% variance)")) +
+  theme_minimal()
+
+```
+PC1 explained 57.3% of the total variance, indicating that the disease status was the most significant source of variation in the data. Moreover, the segregation between the two groups was mainly along the direction of PC1, suggesting that these differentially expressed genes could effectively distinguish patients from the control group
+This indicates that the identified differentially expressed genes can indeed distinguish disease states
+
+### MA plot
+The MA plot shows the relationship between the changes in gene expression and the average expression level
+```{r}
+
+deg_results$Significance <- "Not Significant"
+deg_results$Significance[deg_results$adj.P.Val < 0.05 & deg_results$logFC > 1] <- "Up"
+deg_results$Significance[deg_results$adj.P.Val < 0.05 & deg_results$logFC < -1] <- "Down"
+
+library(ggplot2)
+ggplot(deg_results, aes(x = AveExpr, y = logFC, color = Significance)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  scale_color_manual(values = c("blue", "grey", "red")) +
+  labs(title = "MA Plot",
+       x = "Average Expression (log2)",
+       y = "log2 Fold Change") +
+  theme_minimal()
+
+```
+The expression changes of most genes are concentrated around 0 (gray dots).
+The variability of low-expressed genes (on the left side) is greater, while that of high-expressed genes (on the right side) is smaller
+The number of significantly downregulated genes (blue) is greater than that of significantly up-regulated genes (red).
+This indicates that in the disease state studied, the changes in gene expression tend to be downregulated rather than up-regulated
+
+### Quantile-Quantile Plot
+QQ plots are used to evaluate whether the p-value distribution conforms to theoretical expectations (under the null hypothesis, the p-value should follow a uniform distribution).
+The red dotted line represents the theoretical expectation line (y=x)
+```{r}
+p <- deg_results$P.Value
+
+qqplot_pval <- function(p_values) {
+  observed <- -log10(sort(p_values))
+  expected <- -log10(ppoints(length(p_values)))
+  
+  plot(expected, observed,
+       xlab = "Expected -log10(p)",
+       ylab = "Observed -log10(p)",
+       main = "Q-Q Plot of Raw p-values",
+       pch = 20, col = "darkblue")
+  abline(0, 1, col = "red", lty = 2)
+}
+
+qqplot_pval(p)
+
+
+```
+The blue dots deviate significantly from the red dotted line in most of the range and are located above the dotted line. The curve as a whole is in an upward convex shape, indicating that the actual p-value distribution is more inclined towards the smaller value than the theoretical expectation
+
+This indicates that the analysis results have strong statistical significance, supporting the research hypothesis
+
+
+# Select features(Lasso)
+The LASSO model was used for feature selection and disease prediction of gene expression data
+```{r}
+X <- t(eMat)
+y <- sample_info$disease_status
+
+sig_genes <- rownames(deg_results)[deg_results$adj.P.Val < 0.05 & abs(deg_results$logFC) > 1]
+X <- t(eMat[sig_genes, ])
+
+set.seed(111)
+idx <- createDataPartition(y, p = 0.8, list = FALSE)
+X_train <- X[idx, ]
+X_test  <- X[-idx, ]
+y_train <- y[idx]
+y_test  <- y[-idx]
+
+y_bin <- ifelse(y_train == "Patient", 1, 0)
+
+# LASSO
+cvfit <- cv.glmnet(X_train, y_bin, family = "binomial", alpha = 1)
+best_lambda <- cvfit$lambda.min
+
+model <- glmnet(X_train, y_bin, family = "binomial", alpha = 1, lambda = best_lambda)
+
+prob <- predict(model, newx = X_test, type = "response")[, 1]
+roc_obj <- roc(y_test, prob, levels = c("Control", "Patient"), direction = "<", quiet = TRUE)
+auc_score <- auc(roc_obj)
+cat("AUC:", round(auc_score, 4), "\n")
+
+coef_lasso <- coef(model)
+selected <- coef_lasso[coef_lasso[, 1] != 0, , drop = FALSE]
+selected <- selected[rownames(selected) != "(Intercept)", , drop = FALSE]
+
+selected_df <- data.frame(
+  Gene = rownames(selected),
+  Coefficient = as.numeric(selected[, 1])
+) %>%
+  arrange(desc(abs(Coefficient)))
+
+selected_df
+selected_genes <- selected_df$Gene
+
+```
+AUC = 0.9748 indicates that the model has a strong ability to distinguish patients from the control group
+
+Positive coefficient genes: Elevated expression levels are associated with an increased risk of disease
+
+Negative coefficient genes: Elevated expression levels are associated with a reduced risk of disease
+The absolute value of the coefficient: It reflects the importance of the gene to the prediction result. (1559131_a_at is the most important gene in the model.)
+
+
+```{r}
+# Extract gender and age information
+gender <- ifelse(sample_info$`gender:ch1` == "M", 1, 0)
+age <- as.numeric(sample_info$`age:ch1`)
+X_lasso <- t(eMat[selected_genes, ])
+y_lasso <- sample_info$disease_status
+X_with_gender_age <- cbind(X_lasso, gender = gender, age = age)
+
+```
+
+# Model
+RF
+Extract the important gene expression data  selected by the previous LASSO model
+Integrate the gene expression data with gender and age into a complete feature matrix (23 predictor variables)
+```{r}
+set.seed(111)
+
+cv_ctrl <- trainControl(method = "cv",
+                        number = 10,
+                        classProbs = TRUE,
+                        summaryFunction = twoClassSummary,
+                        savePredictions = "final")
+
+y_cv <- factor(y_lasso, levels = c("Control", "Patient"))
+
+rf_cv_model <- train(x = X_with_gender_age,
+                     y = y_cv,
+                     method = "rf",
+                     metric = "ROC",             
+                     trControl = cv_ctrl,
+                     tuneLength = 5)
+
+
+rf_cv_model
+
+roc_obj <- roc(rf_cv_model$pred$obs,
+               rf_cv_model$pred$Patient,
+               levels = c("Control", "Patient"),
+               direction = "<")
+
+plot(roc_obj, col = "blue", main = "Cross-Validated ROC Curve (Random Forest)")
+auc(roc_obj)
+
+```
+The adjusted parameter is mtry, and the optimal mtry=2, which indicates that the model only requires a small number of features at each node to make the right decision. Sensitivity = 0.9512
+
+The ROC curve is far from the diagonal and most of the area is close to the upper left corner, showing excellent classification performance
+
+AUC=0.9512, indicating that the model has a 95% probability of ranking the randomly selected patient samples ahead of the randomly selected control samples
+
+
+glmnet
+The elastic network combines L1 and L2
+The same input feature matrix contains gene expression data and clinical characteristics (gender, age). Using 10-fold cross-validation, 10 different hyperparameter combinations were automatically tested
+```{r}
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = "final")
+
+set.seed(111)
+lasso_model <- train(x = X_with_gender_age,
+                     y = y_lasso,
+                     method = "glmnet",
+                     metric = "ROC",
+                     trControl = ctrl,
+                     tuneLength = 10)
+
+
+lasso_model
+
+best_lambda <- lasso_model$bestTune$lambda
+coef_final <- coef(lasso_model$finalModel, s = best_lambda)
+selected <- coef_final[coef_final[,1] != 0, , drop = FALSE]
+selected <- selected[rownames(selected) != "(Intercept)", , drop = FALSE]
+
+
+
+```
+The optimal parameter combination: alpha=0.1, lambda=0.003557823
+The mixed model with moderate regularization intensity and biased ridge regression has the best effect
+
+
+SVM
+```{r}
+set.seed(111)
+
+svm_model <- train(
+  x = X_with_gender_age,
+  y = factor(y_lasso, levels = c("Control", "Patient")),
+  method = "svmRadial",
+  trControl = trainControl(
+    method = "cv",
+    number = 10,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  ),
+  metric = "ROC",
+  tuneLength = 5
+)
+
+svm_model
+
+roc_svm <- roc(
+  response = svm_model$pred$obs,
+  predictor = svm_model$pred$Patient,
+  levels = c("Control", "Patient"),
+  direction = "<"
+)
+plot(roc_svm, col = "darkorange", main = "ROC Curve: SVM (Radial)")
+auc(roc_svm)
+
+```
+Hyperparameter :C parameter: Controls the regularization strength of the SVM (penalty parameter). A smaller C allows for more misclassification, while a larger C forces a stricter classification boundary
+
+sigma parameter: Controls the width of the radial basis kernel function, fixed at 0.02643834 (the optimal value automatically determined by the algorithm)
+
+The best parameter combination: C=4.0, sigma=0.02643834. This indicates that a stricter classification boundary (a larger C value) works best, with SEN = 0.916
+
+According to the ROC curve, high sensitivity was rapidly achieved in the low false positive rate region (high specificity). At a sensitivity of approximately 0.9, the specificity remained above 0.9, demonstrating excellent classification ability
+
+KNN
+
+```{r}
+set.seed(111)
+
+knn_model <- train(
+  x = X_with_gender_age,
+  y = factor(y_lasso, levels = c("Control", "Patient")),
+  method = "knn",
+  trControl = trainControl(
+    method = "cv",
+    number = 10,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  ),
+  metric = "ROC",
+  tuneLength = 10
+)
+
+
+knn_model
+roc_knn <- roc(
+  response = knn_model$pred$obs,
+  predictor = knn_model$pred$Patient,
+  levels = c("Control", "Patient"),
+  direction = "<"
+)
+
+plot(roc_knn, col = "darkgreen", main = "ROC Curve: kNN (10-fold CV)")
+auc(roc_knn)
+
+```
+Hyperparameter: K parameter: The number of neighbors. Ten different values were tested from 5 to 23. (The smaller the K value, the more complex the model and the more prone it is to overfitting.)
+
+Optimal parameters: K=21 (selected based on the maximum ROC value) SEN = 0.6417
+
+
+For the ROC, the curve rises rapidly in the region of moderate false positive rate, and then tends to level off in the region of high sensitivity. The shape of the curve indicates that the model sacrifices sensitivity while maintaining high specificity
+
+# Visualization
+rf:
+Random forest uses MeanDecreaseAccuracy to measure the importance of a gene. When the gene is randomly arranged, the average degree of decline in the model's accuracy. The higher the score, the more important the gene is for distinguishing patients from the control group
+```{r}
+imp_rf <- varImp(rf_cv_model)$importance
+imp_rf$Gene <- rownames(imp_rf)
+
+top_rf <- imp_rf %>%
+  arrange(desc(Overall)) %>%
+  slice(1:10)
+
+library(ggplot2)
+ggplot(top_rf, aes(x = reorder(Gene, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Important Genes (Random Forest)",
+       x = "Gene", y = "Top 10 Importance (MeanDecreaseAccuracy)") +
+  theme_minimal()
+```
+
+glmnet：
+Extract the optimal lambda value from the LASSO model
+The coefficient symbol indicates the direction of the association between gene expression and disease status:
+Positive coefficient (green) : Increased gene expression is associated with an increased risk of disease
+Negative coefficient (red) : Increased gene expression is associated with a reduced risk of disease
+```{r}
+best_lambda <- lasso_model$bestTune$lambda
+coef_lasso <- coef(lasso_model$finalModel, s = best_lambda)
+selected <- coef_lasso[coef_lasso[, 1] != 0, , drop = FALSE]
+selected <- selected[rownames(selected) != "(Intercept)", , drop = FALSE]
+
+coef_df <- data.frame(
+  Gene = rownames(selected),
+  Coefficient = as.numeric(selected[, 1])
+)
+
+coef_df$Importance <- abs(coef_df$Coefficient)
+top_glmnet <- coef_df %>%
+  arrange(desc(Importance)) %>%
+  slice(1:10)
+
+ggplot(top_glmnet, aes(x = reorder(Gene, Importance), y = Importance, fill = Coefficient > 0)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = c("firebrick", "forestgreen")) +
+  labs(title = "Important Genes (GLMNET)",
+       x = "Gene", y = "Top 10 Importance Score") +
+  theme_minimal()
+
+```
+
+SVM
+```{r}
+imp_svm <- varImp(svm_model)$importance
+imp_svm$Gene <- rownames(imp_svm)
+
+colname_svm <- colnames(imp_svm)[1]
+imp_svm$Importance <- imp_svm[[colname_svm]]
+
+top_svm <- imp_svm %>%
+  arrange(desc(Importance)) %>%
+  slice(1:10)
+
+ggplot(top_svm, aes(x = reorder(Gene, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "darkorange") +
+  coord_flip() +
+  labs(title = "Important Genes (SVM)",
+       x = "Gene", y = "Top 10 Importance Score") +
+  theme_minimal()
+
+
+```
+For linear SVM, this reflects the contribution of each feature in the decision hyperplane
+For nonlinear SVMS (such as those using RBF kernels), the importance is evaluated by arranging the eigenvalues and measuring the performance changes
+
+knn
+
+```{r}
+imp_knn <- varImp(knn_model)$importance
+imp_knn$Gene <- rownames(imp_knn)
+
+colname_knn <- colnames(imp_knn)[1]
+imp_knn$Importance <- imp_knn[[colname_knn]]
+
+top_knn <- imp_knn %>%
+  arrange(desc(Importance)) %>%
+  slice(1:10)
+
+ggplot(top_knn, aes(x = reorder(Gene, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  coord_flip() +
+  labs(title = "Top 10 Important Genes (kNN)",
+       x = "Gene", y = "Importance Score") +
+  theme_minimal()
+
+```
+By randomly shuffling the value of a certain feature and then measuring the degree of performance degradation of the model
+The disruption of important features will lead to a significant performance degradation, thus achieving a higher importance score
+
+## Overfitting verification
+The performance of four different machine learning models on gene expression data was evaluated through 20 repeated training-test partitions.
+```{r}
+library(caret)
+library(e1071)
+
+set.seed(111)
+
+gender <- ifelse(sample_info$`Sex:ch1` == "male", 1, 0)
+age <- as.numeric(sample_info$`age:ch1`)
+X_full <- cbind(t(eMat[selected_genes, ]), gender = gender, age = age)
+
+y_full <- sample_info$disease_status
+
+
+results_rf <- c()
+results_glmnet <- c()
+results_svm <- c()
+results_knn <- c()
+
+svm_grid <- expand.grid(C = 1, sigma = 0.05)
+knn_grid <- expand.grid(k = 5)
+
+for (i in 1:20) {
+  cat("Iteration:", i, "\n")
+  
+  train_idx <- createDataPartition(y_full, p = 0.8, list = FALSE)
+  X_train <- X_full[train_idx, ]
+  X_test  <- X_full[-train_idx, ]
+  y_train <- factor(y_full[train_idx], levels = c("Control", "Patient"))
+  y_test  <- factor(y_full[-train_idx], levels = c("Control", "Patient"))
+  
+  ctrl <- trainControl(method = "none", classProbs = TRUE)
+  
+# RF
+rf_model_test <- train(x = X_train, y = y_train, method = "rf", trControl = ctrl)
+prob_rf_test <- predict(rf_model_test, X_test, type = "prob")[, "Patient"]
+results_rf <- c(results_rf, auc(y_test, prob_rf_test, levels = c("Control", "Patient"), direction = "<", quiet = TRUE))
+
+# GLMNET
+glmnet_model_test <- train(x = X_train, y = y_train, method = "glmnet", trControl = ctrl, metric = "ROC")
+prob_glmnet_test <- predict(glmnet_model_test, X_test, type = "prob")[, "Patient"]
+results_glmnet <- c(results_glmnet, auc(y_test, prob_glmnet_test, levels = c("Control", "Patient"), direction = "<", quiet = TRUE))
+
+# SVM
+svm_model_test <- train(x = X_train, y = y_train, method = "svmRadial", trControl = ctrl, tuneGrid = svm_grid)
+prob_svm_test <- predict(svm_model_test, X_test, type = "prob")[, "Patient"]
+results_svm <- c(results_svm, auc(y_test, prob_svm_test, levels = c("Control", "Patient"), direction = "<", quiet = TRUE))
+
+# kNN
+knn_model_test <- train(x = X_train, y = y_train, method = "knn", trControl = ctrl, tuneGrid = knn_grid)
+prob_knn_test <- predict(knn_model_test, X_test, type = "prob")[, "Patient"]
+results_knn <- c(results_knn, auc(y_test, prob_knn_test, levels = c("Control", "Patient"), direction = "<", quiet = TRUE))
+}
+
+
+```
+Carry out 20 iterations, each time using different training-test data segmentation, with 80% of the data used for training and 20% for testing
+
+Perform the same training-prediction-evaluation process for each model: 
+RF: Predict the probability that the test set samples are of the "Patient" category
+GLMNET: Predict the category probability of the test set samples and use ROC as the evaluation index
+SVM: Train the SVM model using the Radial Basis function kernel (RBF)
+knn: Train the KNN model using k=5
+
+Performance comparison of four different machine learning models in the task of classifying gene expression data
+```{r}
+df_auc <- data.frame(
+  RF   = results_rf,
+  GLMNET  = results_glmnet,
+  SVM  = results_svm,
+  kNN  = results_knn
+)
+
+boxplot(df_auc, col = c("skyblue", "lightgreen", "orange", "grey"),
+        main = "AUC Comparison across Models (Repeated Hold-out)",
+        ylab = "AUC")
+
+colMeans(df_auc, na.rm = TRUE)
+
+```
+GLMNET performed the best and had the narrowest box, indicating the most stable performance
+
+Comparison of model metrics
+AUC, MSE, and QLIKE compare the performance of the four models in the task of disease classification
+```{r}
+# AUC
+auc_rf     <- auc(rf_cv_model$pred$obs,    rf_cv_model$pred$Patient,    levels = c("Control", "Patient"), direction = "<")
+auc_glmnet <- auc(lasso_model$pred$obs,    lasso_model$pred$Patient,    levels = c("Control", "Patient"), direction = "<")
+auc_svm    <- auc(svm_model$pred$obs,      svm_model$pred$Patient,      levels = c("Control", "Patient"), direction = "<")
+auc_knn    <- auc(knn_model$pred$obs,      knn_model$pred$Patient,      levels = c("Control", "Patient"), direction = "<")
+
+# QLIKE
+qlike <- function(true_label, predicted_prob, positive_class = "Patient") {
+  y <- ifelse(true_label == positive_class, 1, 0)
+  eps <- 1e-15
+  probs <- pmin(pmax(predicted_prob, eps), 1 - eps)
+  mean(y * log(1 / probs) + (1 - y) * probs)
+}
+
+binarize <- function(x) ifelse(x == "Patient", 1, 0)
+
+# RF
+y_rf <- rf_cv_model$pred$obs
+p_rf <- rf_cv_model$pred$Patient
+mse_rf    <- mean((binarize(y_rf) - p_rf)^2, na.rm = TRUE)
+qlike_rf  <- qlike(y_rf, p_rf)
+
+# GLMNET
+y_glm <- lasso_model$pred$obs
+p_glm <- lasso_model$pred$Patient
+mse_glm   <- mean((binarize(y_glm) - p_glm)^2, na.rm = TRUE)
+qlike_glm <- qlike(y_glm, p_glm)
+
+# SVM
+y_svm <- svm_model$pred$obs
+p_svm <- svm_model$pred$Patient
+mse_svm   <- mean((binarize(y_svm) - p_svm)^2, na.rm = TRUE)
+qlike_svm <- qlike(y_svm, p_svm)
+
+# kNN
+y_knn <- knn_model$pred$obs
+p_knn <- knn_model$pred$Patient
+mse_knn   <- mean((binarize(y_knn) - p_knn)^2, na.rm = TRUE)
+qlike_knn <- qlike(y_knn, p_knn)
+
+metrics_df <- data.frame(
+  Model = c("RF", "GLMNET ", "SVM ", "kNN"),
+  AUC   = c(auc_rf, auc_glmnet, auc_svm, auc_knn),
+  MSE   = c(mse_rf, mse_glm, mse_svm, mse_knn),
+  QLIKE = c(qlike_rf, qlike_glm, qlike_svm, qlike_knn)
+)
+
+print(metrics_df)
+
+
+metrics_long <- metrics_df %>%
+  pivot_longer(cols = c("AUC", "MSE", "QLIKE"),
+               names_to = "Metric",
+               values_to = "Value")
+
+ggplot(metrics_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.6) +
+  geom_text(aes(label = round(Value, 3)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.5, size = 3.5) +
+  facet_wrap(~Metric, scales = "free_y") +
+  scale_fill_manual(values = c("AUC" = "steelblue", "MSE" = "tomato", "QLIKE" = "darkgreen")) +
+  labs(title = "Model Performance Comparison",
+       x = "Model", y = "Metric Value") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 15, hjust = 1))
+
+```
+The higher the AUC value, the better. 1.0 represents perfect classification. The lower the MSE value, the better.0 represents perfect prediction. QLIKE. The lower the value, the better
+
+GLMNET > SVM > RF > KNN. The AUC of all models exceeded 0.89, basically having good classification ability. Therefore, GLMNET is the best choice because it performs best in all three indicators and is particularly suitable for scenarios that require high-precision prediction and classification
+
+# Comparison of models with different parameters
+
+Step 1：Prepare data & control parameters
+
+```{r}
+cv_ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+```
+
+Step 2：RF parameter comparison (mtry)
+
+```{r}
+set.seed(111)
+
+rf_grid <- expand.grid(mtry = c(2, 4, 6, 8))
+
+rf_model_tuned <- train(
+  x = X_with_gender_age,
+  y = y_lasso,
+  method = "rf",
+  metric = "ROC",
+  tuneGrid = expand.grid(mtry = c(2, 4, 6, 8, 10, 12)),
+  trControl = cv_ctrl,
+  ntree = 1000  
+)
+
+print(rf_model_tuned)
+
+```
+Test six different mtry values and set the number of trees to 1000, which is larger than the default value (500), to reduce random fluctuations
+Select mtry=2, and the corresponding ROC = 0.96
+
+Step 3：LASSO Parameter Comparison (lambda )
+Test 10 different regularization strength parameters lambda (ranging from 0.001 to 0.1)
+```{r}
+set.seed(111)
+
+glmnet_grid <- expand.grid(
+  alpha = 1,
+  lambda = seq(0.001, 0.1, length.out = 10)
+)
+
+lasso_model_tuned <- train(
+  x = X_with_gender_age,
+  y = y_lasso,
+  method = "glmnet",
+  metric = "ROC",
+  tuneGrid = glmnet_grid,
+  trControl = cv_ctrl
+)
+
+print(lasso_model_tuned)
+
+```
+alpha = 1 and lambda = 0.001.
+
+Step 4：SVM （C, sigma）
+Test nine different combinations of parameters
+```{r}
+set.seed(111)
+
+svm_grid <- expand.grid(
+  C = c(0.1, 1, 10),
+  sigma = c(0.01, 0.05, 0.1)
+)
+
+svm_model_tuned <- train(
+  x = X_with_gender_age,
+  y = y_lasso,
+  method = "svmRadial",
+  metric = "ROC",
+  tuneGrid = svm_grid,
+  trControl = cv_ctrl
+)
+
+print(svm_model_tuned)
+
+```
+
+Step 5：kNN（k）
+
+```{r}
+set.seed(111)
+
+knn_grid <- expand.grid(k = c(3, 5, 7, 9, 11))
+
+knn_model_tuned <- train(
+  x = X_with_gender_age,
+  y = y_lasso,
+  method = "knn",
+  metric = "ROC",
+  tuneGrid = knn_grid,
+  trControl = cv_ctrl
+)
+
+print(knn_model_tuned)
+
+```
+ k = 9
+ 
+Extract the results of the four different models trained earlier and organize them into a data frame
+```{r}
+options(digits = 10)
+
+rf_res <- rf_model_tuned$results %>%
+  mutate(Model = "Random Forest",
+         Parameters = paste0("mtry = ", mtry)) %>%
+  select(Model, Parameters, ROC)
+
+lasso_res <- lasso_model_tuned$results %>%
+  mutate(Model = "LASSO",
+         Parameters = paste0("lambda = ", round(lambda, 4))) %>%
+  select(Model, Parameters, ROC)
+
+svm_res <- svm_model_tuned$results %>%
+  mutate(Model = "SVM (Radial)",
+         Parameters = paste0("C = ", C, ", sigma = ", sigma)) %>%
+  select(Model, Parameters, ROC)
+
+knn_res <- knn_model_tuned$results %>%
+  mutate(Model = "kNN",
+         Parameters = paste0("k = ", k)) %>%
+  select(Model, Parameters, ROC)
+
+all_results_clean <- bind_rows(rf_res, lasso_res, svm_res, knn_res)
+print(all_results_clean)
+
+```
+Random Forest: It is relatively sensitive to the mtry parameter, and performs best with a smaller mtry value (2). As the mtry increases, the overall performance declines, indicating that considering fewer features in each split may help reduce overfitting.
+
+LASSO: The smallest lambda value performs best, indicating that a weaker regularization is beneficial for preserving more useful features. The performance decreases significantly with the increase of lambda, indicating that overly strong regularization may lead to underfitting
+
+SVM: A smaller sigma(0.01) combined with a larger C(10) performs best, indicating that the model requires a higher complexity and a narrower decision boundary. An overly large sigma will reduce the model's discrimination ability
+
+KNN: The smaller k value (3) performs best, indicating that decisions with strong locality may be more suitable for this dataset. The performance first decreases and then increases with the increase of k, suggesting the existence of complex local structures.
+
+Compare the performance of different machine learning models under various parameter Settings
+```{r}
+ggplot(all_results_clean, aes(x = reorder(Parameters, ROC), y = ROC, fill = Model)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  labs(title = "AUC Comparison of Models and Parameters",
+       x = "Parameter Settings", y = "AUC (ROC)",
+       fill = "Model") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        plot.title = element_text(size = 14, face = "bold"))
+
+```
+SVM: It has the best performance but complex parameter tuning, and both C and sigma need to be considered simultaneously
+LASSO: Its performance is close to that of SVM, and its parameter tuning is relatively simple (only lambda).
+Random Forest: Stable performance and insensitive parameters, easy to use
+kNN: It has the lowest performance but is easy to implement and has few parameters
+
+
+# Optimal parameters
+
+```{r}
+best_params <- all_results_clean %>%
+  group_by(Model) %>%
+  slice_max(order_by = ROC, n = 1)
+
+print(best_params)
+
+```
+
+# The model with the final parameters adjusted
+
+1.Final RF（mtry = 2）
+
+```{r}
+set.seed(111)
+final_rf_model <- train(
+  x = X_with_gender_age,
+  y = factor(y_lasso, levels = c("Control", "Patient")),
+  method = "rf",
+  trControl = trainControl(
+    method = "cv",
+    number = 10,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  ),
+  metric = "ROC",
+  tuneGrid = expand.grid(mtry = 2),
+  ntree = 1000
+)
+roc_rf_final <- roc(final_rf_model$pred$obs,
+                    final_rf_model$pred$Patient,
+                    levels = c("Control", "Patient"),
+                    direction = "<")
+
+plot(roc_rf_final, col = "blue", main = "Final RF ROC Curve")
+final_rf_model
+roc_rf_final
+
+```
+
+2.Final glmnet （lambda = 0.001）
+
+```{r}
+set.seed(111)
+final_glmnet_model <- train(
+  x = X_with_gender_age,
+  y = factor(y_lasso, levels = c("Control", "Patient")),
+  method = "glmnet",
+  trControl = trainControl(
+    method = "cv",
+    number = 10,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  ),
+  metric = "ROC",
+  tuneGrid = expand.grid(
+    alpha = 1,
+    lambda = 0.001
+  )
+)
+roc_glmnet_final <- roc(final_glmnet_model$pred$obs,
+                       final_glmnet_model$pred$Patient,
+                       levels = c("Control", "Patient"),
+                       direction = "<")
+
+plot(roc_glmnet_final, col = "firebrick", main = "Final LASSO ROC Curve")
+
+final_glmnet_model
+roc_glmnet_final
+```
+alpha=1 confirms that this is a pure LASSO model (rather than Ridge or ElasticNet)
+lambda=0.001 is a relatively small regularization strength, allowing the model to retain more features
+
+
+3.Final SVM （C = 10, sigma = 0.01）
+
+```{r}
+set.seed(111)
+final_svm_model <- train(
+  x = X_with_gender_age,
+  y = factor(y_lasso, levels = c("Control", "Patient")),
+  method = "svmRadial",
+  trControl = trainControl(
+    method = "cv",
+    number = 10,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  ),
+  metric = "ROC",
+  tuneGrid = expand.grid(
+    C = 10,
+    sigma = 0.01
+  )
+)
+
+roc_svm_final <- roc(final_svm_model$pred$obs,
+                     final_svm_model$pred$Patient,
+                     levels = c("Control", "Patient"),
+                     direction = "<")
+
+plot(roc_svm_final, col = "darkorange", main = "Final SVM ROC Curve")
+final_svm_model
+roc_svm_final
+```
+
+4. Final kNN （k = 3）
+
+```{r}
+set.seed(111)
+final_knn_model <- train(
+  x = X_with_gender_age,
+  y = factor(y_lasso, levels = c("Control", "Patient")),
+  method = "knn",
+  trControl = trainControl(
+    method = "cv",
+    number = 10,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  ),
+  metric = "ROC",
+  tuneGrid = expand.grid(k = 3)
+)
+roc_knn_final <- roc(final_knn_model$pred$obs,
+                     final_knn_model$pred$Patient,
+                     levels = c("Control", "Patient"),
+                     direction = "<")
+
+plot(roc_knn_final, col = "darkgreen", main = "Final kNN ROC Curve")
+
+final_knn_model
+roc_knn_final
+```
+
+Compare the AUC of different models after improvement
+
+```{r}
+# Extract the AUC value
+auc_rf    <- auc(roc_rf_final)
+auc_glmnet <- auc(roc_glmnet_final)
+auc_svm   <- auc(roc_svm_final)
+auc_knn   <- auc(roc_knn_final)
+
+auc_df <- data.frame(
+  Model = c("Random Forest", "glmnet", "SVM (Radial)", "kNN"),
+  AUC = c(auc_rf, auc_glmnet, auc_svm, auc_knn)
+)
+print(auc_df)
+
+```
+
+```{r}
+ggplot(auc_df, aes(x = Model, y = AUC, fill = Model)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = round(AUC, 3)), vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("Random Forest" = "blue",
+                               "glmnet" = "firebrick",
+                               "SVM (Radial)" = "darkorange",
+                               "kNN" = "darkgreen")) +
+  ylim(0, 1.05) +
+  labs(title = "AUC Comparison of Final Models",
+       y = "AUC", x = "") +
+  theme_minimal()
+
+```
+glmnet performed the best, with an AUC reaching 0.981, indicating that the model has an excellent discrimination ability
+
+
+# Visualize the variable importance of each model
+
+```{r}
+best_lambda <- final_glmnet_model$bestTune$lambda
+coef_lasso <- coef(final_glmnet_model$finalModel, s = best_lambda)
+selected <- coef_lasso[coef_lasso[, 1] != 0, , drop = FALSE]
+selected <- selected[rownames(selected) != "(Intercept)", , drop = FALSE]
+
+coef_df <- data.frame(
+  Gene = rownames(selected),
+  Coefficient = as.numeric(selected[, 1]),
+  Importance = abs(selected[, 1])
+)
+
+ggplot(coef_df, aes(x = reorder(Gene, Importance), y = Importance, fill = Coefficient > 0)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = c("firebrick", "forestgreen")) +
+  labs(title = "Important Genes (Lasso)",
+       x = "Gene", y = "Absolute Coefficient") +
+  theme_minimal()
+
+
+```
+
+```{r}
+imp_rf <- varImp(final_rf_model)$importance
+imp_rf$Gene <- rownames(imp_rf)
+
+ggplot(imp_rf, aes(x = reorder(Gene, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "All Important Genes (Random Forest)",
+       x = "Gene", y = "Importance") +
+  theme_minimal()
+
+```
+
+```{r}
+imp_svm <- varImp(final_svm_model)$importance
+imp_svm$Gene <- rownames(imp_svm)
+colname_svm <- colnames(imp_svm)[1]
+imp_svm$Importance <- imp_svm[[colname_svm]]
+
+ggplot(imp_svm, aes(x = reorder(Gene, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "darkorange") +
+  coord_flip() +
+  labs(title = "All Important Genes (SVM)",
+       x = "Gene", y = "Importance Score") +
+  theme_minimal()
+
+```
+
+```{r}
+imp_knn <- varImp(final_knn_model)$importance
+imp_knn$Gene <- rownames(imp_knn)
+colname_knn <- colnames(imp_knn)[1]
+imp_knn$Importance <- imp_knn[[colname_knn]]
+
+ggplot(imp_knn, aes(x = reorder(Gene, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  coord_flip() +
+  labs(title = "All Important Genes (kNN)",
+       x = "Gene", y = "Importance Score") +
+  theme_minimal()
+
+```
+
+```{r}
+qlike <- function(true_label, predicted_prob, positive_class = "Patient") {
+  y   <- ifelse(true_label == positive_class, 1, 0)
+  eps <- 1e-15
+  p   <- pmin(pmax(predicted_prob, eps), 1 - eps)
+  mean(y * log(1 / p) + (1 - y) * p)
+}
+
+binarize <- function(x) ifelse(x == "Patient", 1, 0)
+
+# Accuracy and F1
+get_acc_f1 <- function(truth, prob, threshold = 0.5, positive = "Patient") {
+  pred_class <- ifelse(prob > threshold, positive, "Control")
+  tp <- sum(truth == positive & pred_class == positive)
+  fp <- sum(truth == "Control" & pred_class == positive)
+  fn <- sum(truth == positive & pred_class == "Control")
+  tn <- sum(truth == "Control" & pred_class == "Control")
+  
+  accuracy <- (tp + tn) / (tp + fp + fn + tn)
+  precision <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+  recall    <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+  f1        <- ifelse(precision + recall == 0, 0, 2 * precision * recall / (precision + recall))
+  c(Accuracy = accuracy, F1 = f1)
+}
+
+# RF
+y_rf <- final_rf_model$pred$obs
+p_rf <- final_rf_model$pred$Patient             
+auc_rf     <- auc(y_rf, p_rf, levels = c("Control", "Patient"), direction = "<")
+qlike_rf   <- qlike(y_rf, p_rf)
+met_rf     <- get_acc_f1(y_rf, p_rf)
+
+# glmnet 
+y_glm <- final_glmnet_model$pred$obs
+p_glm <- final_glmnet_model$pred$Patient
+auc_glm    <- auc(y_glm, p_glm, levels = c("Control", "Patient"), direction = "<")
+qlike_glm  <- qlike(y_glm, p_glm)
+met_glm    <- get_acc_f1(y_glm, p_glm)
+
+# SVM 
+y_svm <- final_svm_model$pred$obs
+p_svm <- final_svm_model$pred$Patient
+auc_svm    <- auc(y_svm, p_svm, levels = c("Control", "Patient"), direction = "<")
+qlike_svm  <- qlike(y_svm, p_svm)
+met_svm    <- get_acc_f1(y_svm, p_svm)
+
+# k‑NN 
+y_knn <- final_knn_model$pred$obs
+p_knn <- final_knn_model$pred$Patient
+auc_knn    <- auc(y_knn, p_knn, levels = c("Control", "Patient"), direction = "<")
+qlike_knn  <- qlike(y_knn, p_knn)
+met_knn    <- get_acc_f1(y_knn, p_knn)
+
+
+metrics_final <- data.frame(
+  Model     = c("Random Forest", "Lasso", "SVM (Radial)", "kNN"),
+  AUC       = c(auc_rf, auc_glm, auc_svm, auc_knn),
+  Accuracy  = c(met_rf["Accuracy"],  met_glm["Accuracy"],
+                met_svm["Accuracy"], met_knn["Accuracy"]),
+  F1        = c(met_rf["F1"],        met_glm["F1"],
+                met_svm["F1"],       met_knn["F1"]),
+  QLIKE     = c(qlike_rf, qlike_glm, qlike_svm, qlike_knn)
+)
+
+print(metrics_final)
+
+```
+
+
+```{r}
+metrics_long <- metrics_final %>% 
+  pivot_longer(cols = c(AUC, Accuracy, F1, QLIKE),
+               names_to  = "Metric",
+               values_to = "Value")
+
+metrics_long$Metric <- factor(metrics_long$Metric, levels = c("AUC", "Accuracy", "F1", "QLIKE"))
+metrics_long$Model <- factor(metrics_long$Model, levels = c("Random Forest", "Lasso", "SVM (Radial)", "kNN"))
+
+model_cols <- c("Random Forest" = "blue",
+                "Lasso"        = "red",
+                "SVM (Radial)"  = "orange",
+                "kNN"           = "green")
+
+ggplot(metrics_long, aes(x = Metric, y = Value, fill = Model)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.6) +
+  geom_text(aes(label = round(Value, 3)),
+            position = position_dodge(width = 0.75),
+            vjust = -0.8, size = 2.1, angle = 0) +  
+  scale_fill_manual(values = model_cols) +
+  labs(title = "Grouped Bar Chart of Model Performance Metrics",
+       x = "Metric", y = "Value", fill = "Model") +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(size = 12),
+    plot.title  = element_text(size = 15, face = "bold", hjust = 0.5)
+  ) +
+  ylim(0, max(metrics_long$Value) * 1.15) 
+```
+
+
+```{r}
+auc_handout <- data.frame(
+  Model = rep(c("RF", "GLMNET", "SVM", "kNN"), each = 20),
+  AUC = c(results_rf, results_glmnet, results_svm, results_knn),
+  Type = "Hold-out (20x)"
+)
+
+
+auc_final <- data.frame(
+  Model = c("RF", "GLMNET", "SVM", "kNN"),
+  AUC = c(auc(roc_rf_final),
+          auc(roc_glmnet_final),
+          auc(roc_svm_final),
+          auc(roc_knn_final)),
+  Type = "Final Tuned"
+)
+
+
+auc_final_expanded <- auc_final[rep(1:nrow(auc_final), each = 20), ]
+
+
+combined_auc <- rbind(auc_handout, auc_final_expanded)
+ggplot(combined_auc, aes(x = Model, y = AUC, fill = Type)) +
+  geom_boxplot(outlier.size = 1.5, alpha = 0.7) +
+  labs(title = "Comparison of Hold-out (20x) vs Final Model AUC",
+       x = "Model", y = "AUC") +
+  scale_fill_manual(values = c("Hold-out (20x)" = "skyblue", "Final Tuned" = "tomato")) +
+  theme_minimal()
+```
+
+```{r}
+genes_rf   <- top_rf$Gene
+genes_glm  <- top_glmnet$Gene
+genes_svm  <- top_svm$Gene
+genes_knn  <- top_knn$Gene
+
+common_genes <- Reduce(intersect, list(genes_rf, genes_glm, genes_svm, genes_knn))
+print(common_genes)
+
+```
+
+```{r}
+pred_class_svm <- ifelse(p_svm > 0.5, "Patient", "Control")
+
+pred_class_svm <- factor(pred_class_svm, levels = c("Control", "Patient"))
+y_svm_factor   <- factor(y_svm, levels = c("Control", "Patient"))
+
+cm_svm <- table(Predicted = pred_class_svm, Actual = y_svm_factor)
+print(cm_svm)
+```
+
+```{r}
+cm_svm <- matrix(c(34, 2, 2, 84), nrow = 2, byrow = TRUE,
+                 dimnames = list("Actual" = c("0", "1"), "Predicted" = c("0", "1")))
+# Convert confusion matrix to data frame
+cm_df <- as.data.frame(as.table(cm_svm))
+colnames(cm_df) <- c("Actual", "Predicted", "Freq")
+
+# Plot
+ggplot(cm_df, aes(x = Predicted, y = Actual, fill = Freq)) +
+  geom_tile(color = "black") +
+  geom_text(aes(label = Freq), size = 6, color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  labs(title = "Confusion MATRIX - SVM", x = "Predicted", y = "Actual") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+```
+
+
+```{r}
+ggplot(metrics_long, aes(x = interaction(Metric, Model), y = Value, color = Model)) +
+  geom_segment(aes(xend = interaction(Metric, Model), y = 0, yend = Value),
+               size = 0.8) +
+  geom_point(size = 5) +
+  geom_text(aes(label = round(Value, 3)), vjust = -1.0, size = 3) +
+  scale_color_manual(values = model_cols) +
+  labs(title = "Lollipop Plot of Model Performance Metrics",
+       x = "Metric", y = "Value", color = "Model") +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(size = 8.5, angle = 45, hjust = 1),
+    plot.title  = element_text(size = 15, face = "bold", hjust = 0.5)
+  ) +
+  ylim(0, max(metrics_long$Value) * 1.15)
+```
+
+
+# Week11 
+
+```{r}
+set.seed(111)
+
+lambda_values <- seq(0.001, 0.1, length.out = 10) 
+repeats <- 20 
+results_list <- list()
+
+for (lambda in lambda_values) {
+  auc_vals <- c()
+  
+  for (i in 1:repeats) {
+    idx <- createDataPartition(y_lasso, p = 0.8, list = FALSE) 
+    X_train <- X_with_gender_age[idx, ]
+    X_test  <- X_with_gender_age[-idx, ]
+    y_train <- y_lasso[idx]
+    y_test  <- y_lasso[-idx]
+    model <- glmnet(X_train, ifelse(y_train == "Patient", 1, 0), 
+                    family = "binomial", alpha = 1, lambda = lambda)
+    prob <- predict(model, newx = X_test, type = "response")[, 1]
+    roc_obj <- roc(y_test, prob, levels = c("Control", "Patient"), direction = "<", quiet = TRUE)
+    auc_vals <- c(auc_vals, auc(roc_obj))
+  }
+  results_list[[as.character(lambda)]] <- data.frame(
+    lambda = lambda,
+    AUC = auc_vals
+  )
+}
+
+lambda_auc_df <- do.call(rbind, results_list)
+
+lambda_auc_df$lambda <- factor(lambda_auc_df$lambda, levels = sort(unique(lambda_auc_df$lambda)))
+
+ggplot(lambda_auc_df, aes(x = lambda, y = AUC)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "LASSO AUC across Lambda Values (Repeated CV)",
+       x = "Lambda", y = "AUC (ROC)") +
+  theme_minimal()
+
+
+```
+
+```{r}
+set.seed(111)
+cost_values <- seq(0.1, 10, length.out = 10) 
+repeats <- 20 
+results_list <- list()
+
+library(e1071)  
+library(pROC)   
+library(caret)  
+
+for (cost in cost_values) {
+  auc_vals <- c()
+  
+  for (i in 1:repeats) {
+    idx <- createDataPartition(y_lasso, p = 0.8, list = FALSE)
+    X_train <- X_with_gender_age[idx, ]
+    X_test  <- X_with_gender_age[-idx, ]
+    y_train <- y_lasso[idx]
+    y_test  <- y_lasso[-idx]
+    model <- svm(x = X_train, 
+                 y = y_train, 
+                 type = "C-classification", 
+                 kernel = "radial", 
+                 cost = cost,
+                 probability = TRUE)
+    
+    prob <- attr(predict(model, newdata = X_test, probability = TRUE), "probabilities")[, "Patient"]
+    roc_obj <- roc(y_test, prob, levels = c("Control", "Patient"), direction = "<", quiet = TRUE)
+    auc_vals <- c(auc_vals, auc(roc_obj))
+  }
+  
+  results_list[[as.character(cost)]] <- data.frame(
+    cost = cost,
+    AUC = auc_vals
+  )
+}
+
+cost_auc_df <- do.call(rbind, results_list)
+cost_auc_df$cost <- factor(cost_auc_df$cost, levels = sort(unique(cost_auc_df$cost)))
+
+ggplot(cost_auc_df, aes(x = cost, y = AUC)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "SVM AUC across Cost Values (Repeated CV)",
+       x = "Cost", y = "AUC (ROC)") +
+  theme_minimal()
+
+```
+
+
+
+```{r}
+lasso_df <- coef_df %>% mutate(Model = "LASSO")
+rf_df <- imp_rf %>% rename(Importance = Overall) %>% mutate(Model = "RF")
+svm_df <- imp_svm %>% mutate(Model = "SVM")
+knn_df <- imp_knn %>% mutate(Model = "kNN")
+
+all_imp <- bind_rows(lasso_df, rf_df, svm_df, knn_df)
+
+summary_df <- all_imp %>%
+  group_by(Gene) %>%
+  summarise(
+    Frequency = n(),
+    MeanImportance = mean(Importance, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+top_n_genes <- summary_df %>%
+  arrange(desc(Frequency), desc(MeanImportance)) %>%
+  slice_head(n = 5)
+
+ggplot(top_n_genes, aes(x = reorder(Gene, MeanImportance), y = MeanImportance)) +
+  geom_point(aes(size = Frequency, color = Frequency), alpha = 0.8) +
+  scale_color_viridis_c() +
+  coord_flip() +
+  labs(
+    title = "Top Genes Across All Models",
+    x = "Gene",
+    y = "Mean Importance",
+    size = "Frequency",
+    color = "Frequency"
+  ) +
+  guides(color = guide_legend(), size = guide_legend()) +  
+  theme_minimal()
+
+```
+
+```{r}
+lasso_df <- coef_df %>% mutate(Model = "LASSO")
+rf_df <- imp_rf %>% rename(Importance = Overall) %>% mutate(Model = "RF")
+svm_df <- imp_svm %>% mutate(Model = "SVM")
+knn_df <- imp_knn %>% mutate(Model = "kNN")
+all_imp <- bind_rows(lasso_df, rf_df, svm_df, knn_df)
+
+library(hgu133plus2.db)
+probe2gene <- select(hgu133plus2.db, 
+                    keys = unique(all_imp$Gene), 
+                    columns = c("SYMBOL"), 
+                    keytype = "PROBEID")
+
+create_gene_labels <- function(probe_ids) {
+  labels <- character(length(probe_ids))
+  for (i in 1:length(probe_ids)) {
+    symbol <- probe2gene$SYMBOL[probe2gene$PROBEID == probe_ids[i]]
+    if (length(symbol) > 0 && !is.na(symbol)) {
+      labels[i] <- symbol
+    } else {
+      labels[i] <- probe_ids[i]
+    }
+  }
+  return(labels)
+}
+
+summary_df <- all_imp %>%
+  group_by(Gene) %>%
+  summarise(
+    Frequency = n(),
+    MeanImportance = mean(Importance, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+top_n_genes <- summary_df %>%
+  arrange(desc(Frequency), desc(MeanImportance)) %>%
+  slice_head(n = 5)
+
+top_gene_ids <- top_n_genes$Gene
+top_gene_labels <- create_gene_labels(top_gene_ids)
+plot_df <- top_n_genes %>%
+  mutate(GeneLabel = top_gene_labels)
+
+ggplot(plot_df, aes(x = reorder(GeneLabel, MeanImportance), y = MeanImportance)) +
+  geom_point(aes(size = Frequency, color = Frequency), alpha = 0.8) +
+  scale_color_viridis_c() +
+  coord_flip() +
+  labs(
+    title = "Top 5 Gene Features by Multiple Models",
+    x = "Gene",
+    y = "Mean Importance",
+    size = "Frequency",
+    color = "Frequency"
+  ) +
+  guides(color = guide_legend(), size = guide_legend()) +
+  theme_minimal()
+
+```
+
+
+
+```{r}
+probe2gene <- select(hgu133plus2.db, keys = selected_genes, columns = c("SYMBOL"), keytype = "PROBEID")
+
+```
+
+```{r}
+probe2gene
+```
+
+
+```{r}
+summary(X_with_gender_age)
+
+```
+
+
+
